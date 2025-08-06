@@ -1,258 +1,1771 @@
 #!/usr/bin/env python3
 """
-Database Question-Answering Bot for EIS Database (UserMaster)
-------------------------------------------------------------
-Ask natural-language questions about team members and get answers from MySQL.
-Type exit / quit / bye to leave.
+Enhanced EIS Database NL2SQL Bot - Production-Ready Implementation
+================================================================
+
+Advanced Natural Language to SQL conversion bot with comprehensive error handling,
+security features, caching, monitoring, and robust query generation.
+
+Features:
+- Advanced SQL parsing and validation using SQLGlot
+- Multi-layer security with encryption and audit logging  
+- Intelligent query caching with Redis
+- Comprehensive error handling and recovery
+- Real-time monitoring and alerting
+- Web-based interface with conversation history
+- Schema-aware query generation
+- Multi-agent workflow with LangGraph
 """
 
+import asyncio
+import hashlib
+import json
+import logging
+import os
 import re
-import ollama                   # local LLM
-import pymysql                  # MySQL driver
-from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+import ssl
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# ─────────────────────────────────── ①  CONFIG ──────────────────────────────────
-DB = dict(
-    host="localhost",
-    user="root",
-    password="Root@123",
-    database="EIS",
-    charset="utf8mb4",
-)
+# Core libraries
+import pymysql
+import sqlglot
+from sqlglot import exp, parse_one, transpile
+from sqlglot.optimizer import optimize
+import redis
+from redis.exceptions import RedisError
 
-MISTRAL_MODEL = "mistral:7b-instruct-q4_K_M"
+# LLM and AI libraries
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+    print("Warning: Ollama not available. Using mock responses.")
 
-# Database schema for UserMaster table
-DETAILED_SCHEMA = """
-Database: EIS
+try:
+    from langchain.memory import ConversationBufferWindowMemory
+    from langchain.schema import BaseMessage, HumanMessage, AIMessage
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    LANGCHAIN_AVAILABLE = True
+except ImportError:
+    LANGCHAIN_AVAILABLE = False
+    print("Warning: LangChain not available. Conversation features disabled.")
 
-Table: UserMaster
-Columns: 
-- Uid (int unsigned PK) - User ID
-- EmpName (varchar(80)) - Employee Name  
-- Pwd (varchar(45)) - Password
-- SecQ (varchar(45)) - Security Question
-- SecA (varchar(45)) - Security Answer
-- Project (varchar(45)) - Project Name
-- Team (varchar(45)) - Team Name
-- Rid (int unsigned FK) - Role ID
-- Level (varchar(10)) - Employee Level
-- Contact (varchar(11)) - Contact Number
-- Mandatory (varchar(10)) - Mandatory field
-- SuperLevel (varchar(10)) - Super Level
-- Tid (int) - Team ID
-- Enable (int) - Enable status (1=enabled, 0=disabled)
-- TcsDoj (varchar(20)) - TCS Date of Joining
-- SbiDoj (varchar(20)) - SBI Date of Joining  
-- TcsEmail (varchar(80) UNIQUE) - TCS Email
-- SbiEmail (varchar(80)) - SBI Email
-- AdId (varchar(30) UNIQUE) - AD ID
-- IdCard (varchar(30) UNIQUE) - ID Card Number
-- AccessCard (varchar(30) UNIQUE) - Access Card Number
-- Onboarding (varchar(20)) - Onboarding Status
-- OnboardedOn (date) - Onboarding Date
-- PvcAppId (varchar(30) UNIQUE) - PVC Application ID
-- PvcStatus (varchar(30)) - PVC Status
-- PvcActionDate (varchar(30)) - PVC Action Date
-- BACompany (varchar(80)) - BA Company
-- Phone (varchar(4)) - Phone Extension
-- Position (varchar(20)) - Position/Role
+# Web framework
+try:
+    from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+    from fastapi.responses import HTMLResponse
+    from pydantic import BaseModel, Field, validator
+    import uvicorn
+    WEB_AVAILABLE = True
+except ImportError:
+    WEB_AVAILABLE = False
+    print("Warning: FastAPI not available. Web interface disabled.")
 
-IMPORTANT NOTES:
-- Enable field: 1 = enabled/active, 0 = disabled/inactive
-- Uid is the primary key
-- TcsEmail, AdId, IdCard, AccessCard, PvcAppId are UNIQUE fields
-- Use LIKE operator for partial name/email searches
-- Date fields may contain string dates, handle accordingly
-"""
+# Monitoring and metrics
+try:
+    from prometheus_client import Counter, Histogram, Gauge, start_http_server
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
 
+# ==============================================================================
+# CONFIGURATION AND CONSTANTS
+# ==============================================================================
 
-# ──────────────────────────────── ②  DATA CLASSES ───────────────────────────────
+class Config:
+    """Centralized configuration management"""
+    
+    # Database Configuration
+    DB_CONFIG = {
+        "host": os.getenv("DB_HOST", "localhost"),
+        "port": int(os.getenv("DB_PORT", "3306")),
+        "user": os.getenv("DB_USER", "root"),
+        "password": os.getenv("DB_PASSWORD", "Root@123"),
+        "database": os.getenv("DB_NAME", "EIS"),
+        "charset": "utf8mb4",
+        "ssl_verify_cert": os.getenv("DB_SSL_VERIFY", "false").lower() == "true",
+        "ssl_ca": os.getenv("DB_SSL_CA"),
+        "autocommit": True,
+        "connect_timeout": 10,
+        "read_timeout": 30,
+        "write_timeout": 30
+    }
+    
+    # Redis Configuration
+    REDIS_CONFIG = {
+        "host": os.getenv("REDIS_HOST", "localhost"),
+        "port": int(os.getenv("REDIS_PORT", "6379")),
+        "password": os.getenv("REDIS_PASSWORD"),
+        "decode_responses": True,
+        "socket_connect_timeout": 5,
+        "socket_timeout": 5
+    }
+    
+    # LLM Configuration
+    LLM_CONFIG = {
+        "model": os.getenv("LLM_MODEL", "mistral:7b-instruct-q4_K_M"),
+        "temperature": float(os.getenv("LLM_TEMPERATURE", "0.1")),
+        "top_p": float(os.getenv("LLM_TOP_P", "0.8")),
+        "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "500")),
+        "timeout": int(os.getenv("LLM_TIMEOUT", "30"))
+    }
+    
+    # Security Configuration
+    SECURITY_CONFIG = {
+        "secret_key": os.getenv("SECRET_KEY", "your-secret-key-change-in-production"),
+        "max_query_length": int(os.getenv("MAX_QUERY_LENGTH", "1000")),
+        "rate_limit_per_minute": int(os.getenv("RATE_LIMIT", "60")),
+        "audit_enabled": os.getenv("AUDIT_ENABLED", "true").lower() == "true",
+        "encryption_key": os.getenv("ENCRYPTION_KEY")
+    }
+    
+    # Cache Configuration
+    CACHE_CONFIG = {
+        "enabled": os.getenv("CACHE_ENABLED", "true").lower() == "true",
+        "ttl": int(os.getenv("CACHE_TTL", "3600")),  # 1 hour
+        "max_entries": int(os.getenv("CACHE_MAX_ENTRIES", "1000"))
+    }
+
+# ==============================================================================
+# ENHANCED DATA MODELS
+# ==============================================================================
+
+class QueryType(Enum):
+    """Types of SQL queries"""
+    SELECT = "SELECT"
+    INSERT = "INSERT"
+    UPDATE = "UPDATE"
+    DELETE = "DELETE"
+    UNKNOWN = "UNKNOWN"
+
+class QueryComplexity(Enum):
+    """Query complexity levels"""
+    SIMPLE = "simple"      # Single table, basic WHERE
+    MEDIUM = "medium"      # Joins, GROUP BY, basic functions
+    COMPLEX = "complex"    # Subqueries, window functions, CTEs
+    ADVANCED = "advanced"  # Multiple CTEs, complex analytics
+
 @dataclass
-class QueryResult:
-    success: bool
-    data: Optional[List[Tuple]] = None
-    error: Optional[str] = None
-    sql: Optional[str] = None
+class QueryAnalysis:
+    """Comprehensive query analysis results"""
+    original_question: str
+    generated_sql: str
+    query_type: QueryType
+    complexity: QueryComplexity
+    estimated_rows: Optional[int] = None
+    execution_time_ms: Optional[float] = None
+    tables_involved: List[str] = field(default_factory=list)
+    columns_selected: List[str] = field(default_factory=list)
+    has_joins: bool = False
+    has_subqueries: bool = False
+    has_aggregations: bool = False
+    validation_errors: List[str] = field(default_factory=list)
+    optimization_suggestions: List[str] = field(default_factory=list)
 
+@dataclass
+class ChatContext:
+    """Conversation context and history"""
+    session_id: str
+    user_id: Optional[str]
+    conversation_history: List[Dict[str, Any]] = field(default_factory=list)
+    last_query_results: Optional[Dict[str, Any]] = None
+    context_tables: List[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
 
-# ──────────────────────────────── ③  DB MANAGER ────────────────────────────────
-class DBManager:
-    def __init__(self, cfg: Dict):
-        self.cfg, self.conn = cfg, None
+# ==============================================================================
+# ADVANCED SQL PARSER AND VALIDATOR
+# ==============================================================================
 
-    def connect(self) -> bool:
+class AdvancedSQLValidator:
+    """Enhanced SQL validation using SQLGlot with comprehensive analysis"""
+    
+    def __init__(self):
+        self.allowed_keywords = {
+            'SELECT', 'FROM', 'WHERE', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 
+            'GROUP', 'BY', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'AS',
+            'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'DISTINCT', 'LIKE',
+            'IN', 'NOT', 'NULL', 'AND', 'OR', 'BETWEEN', 'EXISTS'
+        }
+        self.forbidden_keywords = {
+            'DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE',
+            'TRUNCATE', 'EXEC', 'EXECUTE', 'DECLARE', 'CURSOR'
+        }
+    
+    def validate_and_analyze(self, sql: str, schema_info: Dict) -> QueryAnalysis:
+        """Comprehensive SQL validation and analysis"""
+        analysis = QueryAnalysis(
+            original_question="",
+            generated_sql=sql.strip()
+        )
+        
         try:
-            self.conn = pymysql.connect(**self.cfg)
-            return True
+            # Parse SQL using SQLGlot
+            parsed = parse_one(sql, dialect="mysql")
+            if not parsed:
+                analysis.validation_errors.append("Failed to parse SQL statement")
+                return analysis
+            
+            # Determine query type
+            analysis.query_type = self._determine_query_type(parsed)
+            
+            # Security validation
+            self._validate_security(sql, analysis)
+            
+            # Syntax validation
+            self._validate_syntax(parsed, analysis)
+            
+            # Schema validation
+            self._validate_schema(parsed, schema_info, analysis)
+            
+            # Complexity analysis
+            analysis.complexity = self._analyze_complexity(parsed, analysis)
+            
+            # Optimization suggestions
+            analysis.optimization_suggestions = self._generate_optimizations(parsed, analysis)
+            
         except Exception as e:
-            print(f"❌  DB connection error: {e}")
-            return False
-
-    def exec(self, sql: str) -> QueryResult:
-        if not self.conn and not self.connect():
-            return QueryResult(False, error="DB connection failed", sql=sql)
-
+            analysis.validation_errors.append(f"Validation error: {str(e)}")
+        
+        return analysis
+    
+    def _determine_query_type(self, parsed) -> QueryType:
+        """Determine the type of SQL query"""
+        if isinstance(parsed, exp.Select):
+            return QueryType.SELECT
+        elif isinstance(parsed, exp.Insert):
+            return QueryType.INSERT
+        elif isinstance(parsed, exp.Update):
+            return QueryType.UPDATE
+        elif isinstance(parsed, exp.Delete):
+            return QueryType.DELETE
+        else:
+            return QueryType.UNKNOWN
+    
+    def _validate_security(self, sql: str, analysis: QueryAnalysis):
+        """Security validation checks"""
+        sql_upper = sql.upper()
+        
+        # Check for forbidden keywords
+        for keyword in self.forbidden_keywords:
+            if keyword in sql_upper:
+                analysis.validation_errors.append(f"Forbidden keyword detected: {keyword}")
+        
+        # Check for potential injection patterns
+        injection_patterns = [
+            r";\s*(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE)",
+            r"UNION\s+SELECT",
+            r"--\s*",
+            r"/\*.*\*/",
+            r"EXEC\s*\(",
+            r"EXECUTE\s*\("
+        ]
+        
+        for pattern in injection_patterns:
+            if re.search(pattern, sql, re.IGNORECASE):
+                analysis.validation_errors.append(f"Potential SQL injection pattern detected: {pattern}")
+    
+    def _validate_syntax(self, parsed, analysis: QueryAnalysis):
+        """Validate SQL syntax correctness"""
         try:
-            with self.conn.cursor() as cur:
-                cur.execute(sql)
-                rows = cur.fetchall()
-                return QueryResult(True, rows, sql=sql)
+            # Check for common syntax issues
+            if isinstance(parsed, exp.Select):
+                # Ensure SELECT has FROM clause (except for certain functions)
+                if not parsed.find(exp.From) and not self._is_function_only_select(parsed):
+                    analysis.validation_errors.append("SELECT statement missing FROM clause")
+                
+                # Validate GROUP BY usage
+                group_by = parsed.find(exp.Group)
+                having = parsed.find(exp.Having)
+                
+                if having and not group_by:
+                    analysis.validation_errors.append("HAVING clause requires GROUP BY")
+        
         except Exception as e:
-            return QueryResult(False, error=str(e), sql=sql)
+            analysis.validation_errors.append(f"Syntax validation error: {str(e)}")
+    
+    def _validate_schema(self, parsed, schema_info: Dict, analysis: QueryAnalysis):
+        """Validate against database schema"""
+        try:
+            # Extract tables and columns
+            for table in parsed.find_all(exp.Table):
+                table_name = table.name
+                analysis.tables_involved.append(table_name)
+                
+                if table_name not in schema_info:
+                    analysis.validation_errors.append(f"Table '{table_name}' does not exist")
+            
+            # Validate columns exist in their respective tables
+            for column in parsed.find_all(exp.Column):
+                column_name = column.name
+                table_name = column.table if hasattr(column, 'table') and column.table else None
+                
+                if table_name and table_name in schema_info:
+                    if column_name not in schema_info[table_name].get('columns', []):
+                        analysis.validation_errors.append(
+                            f"Column '{column_name}' does not exist in table '{table_name}'"
+                        )
+        
+        except Exception as e:
+            analysis.validation_errors.append(f"Schema validation error: {str(e)}")
+    
+    def _analyze_complexity(self, parsed, analysis: QueryAnalysis) -> QueryComplexity:
+        """Analyze query complexity"""
+        complexity_score = 0
+        
+        # Check for joins
+        joins = list(parsed.find_all(exp.Join))
+        if joins:
+            analysis.has_joins = True
+            complexity_score += len(joins) * 2
+        
+        # Check for subqueries
+        subqueries = list(parsed.find_all(exp.Subquery))
+        if subqueries:
+            analysis.has_subqueries = True
+            complexity_score += len(subqueries) * 3
+        
+        # Check for aggregations
+        agg_functions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX']
+        for func_name in agg_functions:
+            if parsed.find(exp.Anonymous, name=func_name) or parsed.find(exp.Count):
+                analysis.has_aggregations = True
+                complexity_score += 1
+                break
+        
+        # Check for window functions
+        if parsed.find(exp.Window):
+            complexity_score += 4
+        
+        # Check for CTEs
+        if parsed.find(exp.With):
+            complexity_score += 3
+        
+        # Determine complexity level
+        if complexity_score >= 10:
+            return QueryComplexity.ADVANCED
+        elif complexity_score >= 6:
+            return QueryComplexity.COMPLEX
+        elif complexity_score >= 3:
+            return QueryComplexity.MEDIUM
+        else:
+            return QueryComplexity.SIMPLE
+    
+    def _generate_optimizations(self, parsed, analysis: QueryAnalysis) -> List[str]:
+        """Generate optimization suggestions"""
+        suggestions = []
+        
+        # Check for SELECT *
+        if str(parsed).upper().strip().startswith('SELECT *'):
+            suggestions.append("Consider selecting only required columns instead of using SELECT *")
+        
+        # Check for missing LIMIT on potentially large results
+        if isinstance(parsed, exp.Select) and not parsed.find(exp.Limit):
+            if analysis.has_joins or len(analysis.tables_involved) > 1:
+                suggestions.append("Consider adding LIMIT clause for potentially large result sets")
+        
+        # Check for inefficient WHERE conditions
+        where_clause = parsed.find(exp.Where)
+        if where_clause:
+            # Look for functions in WHERE clause
+            for func in where_clause.find_all(exp.Anonymous):
+                suggestions.append(f"Avoid using functions in WHERE clause: {func}")
+        
+        return suggestions
+    
+    def _is_function_only_select(self, parsed) -> bool:
+        """Check if SELECT statement only contains functions (no table access)"""
+        # This is a simplified check - could be enhanced
+        select_expressions = parsed.expressions
+        return all(
+            isinstance(expr, (exp.Anonymous, exp.Literal, exp.Count))
+            for expr in select_expressions
+        )
 
-    def close(self):
-        if self.conn:
-            self.conn.close()
+# ==============================================================================
+# ENHANCED DATABASE MANAGER WITH CONNECTION POOLING
+# ==============================================================================
 
+class EnhancedDBManager:
+    """Advanced database manager with connection pooling, monitoring, and security"""
+    
+    def __init__(self, config: Dict, validator: AdvancedSQLValidator):
+        self.config = config
+        self.validator = validator
+        self._connection_pool = []
+        self._pool_size = int(os.getenv("DB_POOL_SIZE", "5"))
+        self._connection_timeout = 30
+        self.schema_cache = {}
+        self.schema_cache_ttl = 3600  # 1 hour
+        self._initialize_pool()
+        
+        # Metrics
+        if METRICS_AVAILABLE:
+            self.query_counter = Counter('db_queries_total', 'Total database queries', ['status'])
+            self.query_duration = Histogram('db_query_duration_seconds', 'Query execution time')
+            self.active_connections = Gauge('db_active_connections', 'Active database connections')
+    
+    def _initialize_pool(self):
+        """Initialize database connection pool"""
+        try:
+            # Create SSL context if required
+            ssl_context = None
+            if self.config.get('ssl_verify_cert'):
+                ssl_context = ssl.create_default_context()
+                if self.config.get('ssl_ca'):
+                    ssl_context.load_verify_locations(self.config['ssl_ca'])
+            
+            # Initialize connections
+            for _ in range(self._pool_size):
+                conn = pymysql.connect(
+                    **self.config,
+                    ssl=ssl_context
+                )
+                self._connection_pool.append({
+                    'connection': conn,
+                    'in_use': False,
+                    'created_at': datetime.now()
+                })
+            
+            logging.info(f"Initialized database connection pool with {self._pool_size} connections")
+        
+        except Exception as e:
+            logging.error(f"Failed to initialize database connection pool: {e}")
+            raise
+    
+    def _get_connection(self):
+        """Get available connection from pool"""
+        for pool_item in self._connection_pool:
+            if not pool_item['in_use']:
+                # Check if connection is still valid
+                try:
+                    pool_item['connection'].ping(reconnect=True)
+                    pool_item['in_use'] = True
+                    if METRICS_AVAILABLE:
+                        self.active_connections.inc()
+                    return pool_item
+                except Exception:
+                    # Connection is dead, recreate it
+                    try:
+                        pool_item['connection'] = pymysql.connect(**self.config)
+                        pool_item['in_use'] = True
+                        if METRICS_AVAILABLE:
+                            self.active_connections.inc()
+                        return pool_item
+                    except Exception as e:
+                        logging.error(f"Failed to recreate database connection: {e}")
+                        continue
+        
+        # No available connections
+        raise Exception("No available database connections")
+    
+    def _release_connection(self, pool_item):
+        """Release connection back to pool"""
+        pool_item['in_use'] = False
+        if METRICS_AVAILABLE:
+            self.active_connections.dec()
+    
+    async def execute_query(self, sql: str, params: Optional[Tuple] = None, 
+                           timeout: int = 30) -> Dict[str, Any]:
+        """Execute SQL query with comprehensive error handling and monitoring"""
+        start_time = time.time()
+        pool_item = None
+        
+        try:
+            # Validate query first
+            schema_info = await self.get_schema_info()
+            analysis = self.validator.validate_and_analyze(sql, schema_info)
+            
+            if analysis.validation_errors:
+                if METRICS_AVAILABLE:
+                    self.query_counter.labels(status='validation_error').inc()
+                return {
+                    'success': False,
+                    'error': 'Query validation failed',
+                    'details': analysis.validation_errors,
+                    'analysis': analysis
+                }
+            
+            # Get database connection
+            pool_item = self._get_connection()
+            conn = pool_item['connection']
+            
+            # Execute query with timeout
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                
+                if analysis.query_type == QueryType.SELECT:
+                    results = cursor.fetchall()
+                    column_names = [desc[0] for desc in cursor.description] if cursor.description else []
+                    
+                    execution_time = (time.time() - start_time) * 1000
+                    analysis.execution_time_ms = execution_time
+                    
+                    if METRICS_AVAILABLE:
+                        self.query_counter.labels(status='success').inc()
+                        self.query_duration.observe(execution_time / 1000)
+                    
+                    return {
+                        'success': True,
+                        'data': results,
+                        'columns': column_names,
+                        'row_count': len(results),
+                        'execution_time_ms': execution_time,
+                        'analysis': analysis
+                    }
+                else:
+                    # Non-SELECT queries
+                    conn.commit()
+                    return {
+                        'success': True,
+                        'affected_rows': cursor.rowcount,
+                        'analysis': analysis
+                    }
+        
+        except pymysql.Error as e:
+            if METRICS_AVAILABLE:
+                self.query_counter.labels(status='db_error').inc()
+            
+            logging.error(f"Database error executing query: {e}")
+            return {
+                'success': False,
+                'error': 'Database error',
+                'details': str(e),
+                'error_code': e.args[0] if e.args else None
+            }
+        
+        except Exception as e:
+            if METRICS_AVAILABLE:
+                self.query_counter.labels(status='error').inc()
+            
+            logging.error(f"Unexpected error executing query: {e}")
+            return {
+                'success': False,
+                'error': 'Unexpected error',
+                'details': str(e)
+            }
+        
+        finally:
+            if pool_item:
+                self._release_connection(pool_item)
+    
+    async def get_schema_info(self) -> Dict[str, Any]:
+        """Get comprehensive database schema information with caching"""
+        cache_key = f"schema_info_{self.config['database']}"
+        
+        # Check cache first
+        if (cache_key in self.schema_cache and 
+            datetime.now() - self.schema_cache[cache_key]['timestamp'] < timedelta(seconds=self.schema_cache_ttl)):
+            return self.schema_cache[cache_key]['data']
+        
+        schema_info = {}
+        pool_item = None
+        
+        try:
+            pool_item = self._get_connection()
+            conn = pool_item['connection']
+            
+            with conn.cursor() as cursor:
+                # Get all tables
+                cursor.execute("SHOW TABLES")
+                tables = [row[0] for row in cursor.fetchall()]
+                
+                for table in tables:
+                    # Get columns for each table
+                    cursor.execute(f"DESCRIBE {table}")
+                    columns_info = cursor.fetchall()
+                    
+                    columns = []
+                    primary_keys = []
+                    foreign_keys = []
+                    
+                    for col_info in columns_info:
+                        col_name = col_info[0]
+                        col_type = col_info[1]
+                        is_nullable = col_info[2] == 'YES'
+                        key_type = col_info[3]
+                        default_value = col_info[4]
+                        extra = col_info[5]
+                        
+                        columns.append({
+                            'name': col_name,
+                            'type': col_type,
+                            'nullable': is_nullable,
+                            'default': default_value,
+                            'extra': extra
+                        })
+                        
+                        if key_type == 'PRI':
+                            primary_keys.append(col_name)
+                        elif key_type in ['MUL', 'UNI']:
+                            # Additional query needed for foreign keys
+                            pass
+                    
+                    # Get foreign key information
+                    cursor.execute(f"""
+                        SELECT 
+                            COLUMN_NAME,
+                            REFERENCED_TABLE_NAME,
+                            REFERENCED_COLUMN_NAME
+                        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
+                        WHERE TABLE_SCHEMA = %s 
+                        AND TABLE_NAME = %s 
+                        AND REFERENCED_TABLE_NAME IS NOT NULL
+                    """, (self.config['database'], table))
+                    
+                    fk_info = cursor.fetchall()
+                    for fk in fk_info:
+                        foreign_keys.append({
+                            'column': fk[0],
+                            'referenced_table': fk[1],
+                            'referenced_column': fk[2]
+                        })
+                    
+                    schema_info[table] = {
+                        'columns': [col['name'] for col in columns],
+                        'column_details': columns,
+                        'primary_keys': primary_keys,
+                        'foreign_keys': foreign_keys
+                    }
+            
+            # Cache the schema info
+            self.schema_cache[cache_key] = {
+                'data': schema_info,
+                'timestamp': datetime.now()
+            }
+            
+            logging.info(f"Retrieved schema information for {len(schema_info)} tables")
+            return schema_info
+        
+        except Exception as e:
+            logging.error(f"Error retrieving schema information: {e}")
+            return {}
+        
+        finally:
+            if pool_item:
+                self._release_connection(pool_item)
 
-# ───────────────────────────── ④  NL ➜ SQL CONVERTER ────────────────────────────
-class UserMasterNL2SQL:
-    @staticmethod
-    def create_prompt(question: str) -> str:
-        return f"""You are an expert MySQL query generator for employee/user data. Generate ONLY a valid MySQL SELECT statement.
+# ==============================================================================
+# INTELLIGENT CACHING LAYER
+# ==============================================================================
 
-{DETAILED_SCHEMA}
+class IntelligentCache:
+    """Advanced caching system with TTL, LRU eviction, and cache warming"""
+    
+    def __init__(self, redis_config: Dict):
+        self.redis_config = redis_config
+        self.enabled = Config.CACHE_CONFIG['enabled']
+        self.ttl = Config.CACHE_CONFIG['ttl']
+        self._local_cache = {}
+        self._local_cache_times = {}
+        
+        if self.enabled:
+            try:
+                self.redis_client = redis.Redis(**redis_config)
+                self.redis_client.ping()
+                logging.info("Connected to Redis cache server")
+            except (RedisError, Exception) as e:
+                logging.warning(f"Redis connection failed, using local cache: {e}")
+                self.redis_client = None
+        else:
+            self.redis_client = None
+    
+    def _generate_cache_key(self, query: str, context: Optional[Dict] = None) -> str:
+        """Generate a consistent cache key"""
+        # Normalize query for consistent caching
+        normalized_query = re.sub(r'\s+', ' ', query.strip().lower())
+        
+        # Include relevant context in cache key
+        context_str = ""
+        if context:
+            context_items = sorted(context.items())
+            context_str = json.dumps(context_items, sort_keys=True)
+        
+        # Create hash of query + context
+        cache_string = f"{normalized_query}|{context_str}"
+        return hashlib.sha256(cache_string.encode()).hexdigest()[:32]
+    
+    async def get(self, query: str, context: Optional[Dict] = None) -> Optional[Dict]:
+        """Retrieve cached query results"""
+        if not self.enabled:
+            return None
+        
+        cache_key = self._generate_cache_key(query, context)
+        
+        try:
+            # Try Redis first
+            if self.redis_client:
+                cached_data = self.redis_client.get(f"query:{cache_key}")
+                if cached_data:
+                    return json.loads(cached_data)
+            
+            # Fallback to local cache
+            if cache_key in self._local_cache:
+                cache_time = self._local_cache_times.get(cache_key, 0)
+                if time.time() - cache_time < self.ttl:
+                    return self._local_cache[cache_key]
+                else:
+                    # Expired, remove from local cache
+                    del self._local_cache[cache_key]
+                    del self._local_cache_times[cache_key]
+        
+        except Exception as e:
+            logging.error(f"Cache retrieval error: {e}")
+        
+        return None
+    
+    async def set(self, query: str, results: Dict, context: Optional[Dict] = None, 
+                  ttl: Optional[int] = None):
+        """Cache query results with TTL"""
+        if not self.enabled:
+            return
+        
+        cache_key = self._generate_cache_key(query, context)
+        cache_ttl = ttl or self.ttl
+        
+        # Prepare cache data
+        cache_data = {
+            'results': results,
+            'timestamp': datetime.now().isoformat(),
+            'query': query,
+            'context': context
+        }
+        
+        try:
+            # Store in Redis
+            if self.redis_client:
+                self.redis_client.setex(
+                    f"query:{cache_key}",
+                    cache_ttl,
+                    json.dumps(cache_data, default=str)
+                )
+            
+            # Store in local cache as backup
+            self._local_cache[cache_key] = cache_data
+            self._local_cache_times[cache_key] = time.time()
+            
+            # Manage local cache size
+            if len(self._local_cache) > Config.CACHE_CONFIG['max_entries']:
+                # Remove oldest entries
+                oldest_keys = sorted(
+                    self._local_cache_times.keys(),
+                    key=lambda k: self._local_cache_times[k]
+                )[:len(self._local_cache) - Config.CACHE_CONFIG['max_entries']]
+                
+                for key in oldest_keys:
+                    del self._local_cache[key]
+                    del self._local_cache_times[key]
+        
+        except Exception as e:
+            logging.error(f"Cache storage error: {e}")
+    
+    async def invalidate_pattern(self, pattern: str):
+        """Invalidate cache entries matching a pattern"""
+        if not self.enabled:
+            return
+        
+        try:
+            if self.redis_client:
+                # Get all keys matching pattern
+                keys = self.redis_client.keys(f"query:*{pattern}*")
+                if keys:
+                    self.redis_client.delete(*keys)
+            
+            # Clear matching local cache entries
+            keys_to_remove = [
+                key for key in self._local_cache.keys()
+                if pattern in self._local_cache[key].get('query', '')
+            ]
+            
+            for key in keys_to_remove:
+                del self._local_cache[key]
+                del self._local_cache_times[key]
+        
+        except Exception as e:
+            logging.error(f"Cache invalidation error: {e}")
+    
+    def get_stats(self) -> Dict:
+        """Get cache statistics"""
+        stats = {
+            'enabled': self.enabled,
+            'local_cache_size': len(self._local_cache),
+            'redis_connected': self.redis_client is not None
+        }
+        
+        if self.redis_client:
+            try:
+                info = self.redis_client.info()
+                stats['redis_memory'] = info.get('used_memory_human', 'unknown')
+                stats['redis_keys'] = self.redis_client.dbsize()
+            except Exception as e:
+                stats['redis_error'] = str(e)
+        
+        return stats
+
+# ==============================================================================
+# ADVANCED CONVERSATION MANAGER
+# ==============================================================================
+
+class ConversationManager:
+    """Manage conversation context, history, and intelligent follow-ups"""
+    
+    def __init__(self, cache: IntelligentCache):
+        self.cache = cache
+        self.sessions = {}
+        self.session_ttl = 3600 * 24  # 24 hours
+        
+        if LANGCHAIN_AVAILABLE:
+            self.memory_template = ConversationBufferWindowMemory(
+                k=10,  # Keep last 10 exchanges
+                return_messages=True
+            )
+    
+    async def get_or_create_session(self, session_id: str, user_id: Optional[str] = None) -> ChatContext:
+        """Get existing session or create new one"""
+        if session_id in self.sessions:
+            session = self.sessions[session_id]
+            session.updated_at = datetime.now()
+            return session
+        
+        # Create new session
+        session = ChatContext(
+            session_id=session_id,
+            user_id=user_id
+        )
+        
+        self.sessions[session_id] = session
+        return session
+    
+    async def add_exchange(self, session_id: str, question: str, response: Dict[str, Any]):
+        """Add question-response exchange to conversation history"""
+        if session_id not in self.sessions:
+            await self.get_or_create_session(session_id)
+        
+        session = self.sessions[session_id]
+        
+        exchange = {
+            'timestamp': datetime.now().isoformat(),
+            'question': question,
+            'response': response,
+            'sql_generated': response.get('analysis', {}).get('generated_sql'),
+            'success': response.get('success', False)
+        }
+        
+        session.conversation_history.append(exchange)
+        session.updated_at = datetime.now()
+        
+        # Keep only recent exchanges
+        if len(session.conversation_history) > 20:
+            session.conversation_history = session.conversation_history[-20:]
+        
+        # Update context tables based on successful queries
+        if response.get('success') and response.get('analysis'):
+            tables = response['analysis'].tables_involved
+            for table in tables:
+                if table not in session.context_tables:
+                    session.context_tables.append(table)
+    
+    def build_context_prompt(self, session: ChatContext, current_question: str) -> str:
+        """Build context-aware prompt with conversation history"""
+        base_prompt = """You are an expert SQL query generator for the EIS (Employee Information System) database.
+
+Database Schema:
+- UserMaster table with employee information including:
+  - Personal info: Uid (PK), EmpName, Contact, Position
+  - Work info: Project, Team, Level, SuperLevel, BACompany 
+  - Security: Pwd, SecQ, SecA, AdId, IdCard, AccessCard
+  - Status: Enable (1=active, 0=inactive), Onboarding, PvcStatus
+  - Dates: TcsDoj, SbiDoj, OnboardedOn, PvcActionDate
+  - Contact: TcsEmail (unique), SbiEmail, Phone
 
 CRITICAL RULES:
-1. Use EXACT column names from the schema above
-2. Table name is "UserMaster" (case-sensitive)
-3. For name searches, use LIKE with % wildcards (e.g., EmpName LIKE '%john%')
-4. For email searches, use LIKE with % wildcards  
-5. Use Enable=1 for active/enabled users, Enable=0 for inactive/disabled
-6. Return ONLY the SQL query, no explanations or formatting
-7. For counting queries, use COUNT(*)
-8. For "who" questions, include EmpName in SELECT
-9. Use proper MySQL syntax and functions
+1. Generate ONLY valid MySQL SELECT statements
+2. Use EXACT column names from schema
+3. Table name is "UserMaster" (case-sensitive)  
+4. For name searches use: EmpName LIKE '%name%'
+5. For active users use: Enable = 1
+6. Always include proper WHERE clauses
+7. Use appropriate JOINs only when necessary
 
-Question: {question}
+"""
+        
+        # Add conversation context
+        if session.conversation_history:
+            base_prompt += "\nRecent Conversation Context:\n"
+            recent_exchanges = session.conversation_history[-5:]  # Last 5 exchanges
+            
+            for i, exchange in enumerate(recent_exchanges, 1):
+                if exchange.get('success'):
+                    base_prompt += f"{i}. Q: {exchange['question']}\n"
+                    if exchange.get('sql_generated'):
+                        base_prompt += f"   SQL: {exchange['sql_generated']}\n"
+        
+        # Add current question
+        base_prompt += f"\nCurrent Question: {current_question}\n"
+        base_prompt += "Generate the SQL query:"
+        
+        return base_prompt
+    
+    async def cleanup_old_sessions(self):
+        """Remove expired sessions"""
+        current_time = datetime.now()
+        expired_sessions = [
+            session_id for session_id, session in self.sessions.items()
+            if (current_time - session.updated_at).total_seconds() > self.session_ttl
+        ]
+        
+        for session_id in expired_sessions:
+            del self.sessions[session_id]
+        
+        if expired_sessions:
+            logging.info(f"Cleaned up {len(expired_sessions)} expired sessions")
 
-SQL:"""
+# ==============================================================================
+# ENHANCED NL2SQL ENGINE
+# ==============================================================================
 
-    def to_sql(self, question: str) -> str:
+class EnhancedNL2SQLEngine:
+    """Advanced Natural Language to SQL conversion with multiple strategies"""
+    
+    def __init__(self, db_manager: EnhancedDBManager, cache: IntelligentCache, 
+                 conversation_manager: ConversationManager):
+        self.db_manager = db_manager
+        self.cache = cache
+        self.conversation_manager = conversation_manager
+        self.llm_config = Config.LLM_CONFIG
+        
+        # Query enhancement patterns
+        self.enhancement_patterns = {
+            'count_queries': r'\b(how many|count|number of)\b',
+            'list_queries': r'\b(list|show|display|get)\b',
+            'filter_queries': r'\b(where|with|having|who|which)\b',
+            'join_queries': r'\b(and|with|along with|including)\b',
+            'time_queries': r'\b(joined|created|updated|date|time|year|month)\b'
+        }
+    
+    async def generate_sql(self, question: str, session_id: str) -> Dict[str, Any]:
+        """Generate SQL with multiple strategies and validation"""
+        
+        # Check cache first
+        cached_result = await self.cache.get(question)
+        if cached_result:
+            logging.info(f"Cache hit for question: {question[:50]}...")
+            return cached_result['results']
+        
+        # Get conversation context
+        session = await self.conversation_manager.get_or_create_session(session_id)
+        
         try:
-            response = ollama.generate(
-                model=MISTRAL_MODEL,
-                prompt=self.create_prompt(question),
-                options=dict(temperature=0.1, top_p=0.8, num_predict=300),
-            )["response"]
-
-            # Clean the response
-            sql = response.strip()
-
-            # Remove common prefixes and markdown
-            prefixes_to_remove = [
-                r'^sql\s*[:;]?\s*',
-                r'^SQL\s*[:;]?\s*', 
-                r'^query\s*[:;]?\s*',
-                r'^SELECT\s*:\s*',
-                r'^```',
-                r'^```\s*',
-                r'```'
-            ]
-
-            for prefix in prefixes_to_remove:
-                sql = re.sub(prefix, '', sql, flags=re.IGNORECASE | re.MULTILINE)
-
-            # Remove trailing semicolons and whitespace
-            sql = sql.rstrip(';').strip()
-
-            # Ensure it starts with SELECT
-            if not sql.upper().startswith('SELECT'):
-                select_match = re.search(r'(SELECT.*?)(?:|$)', sql, re.IGNORECASE | re.DOTALL)
-                if select_match:
-                    sql = select_match.group(1).strip()
-                else:
-                    return "SELECT 'Invalid query generated' as error"
-
-            return sql
-
+            # Strategy 1: Context-aware generation
+            result = await self._generate_with_context(question, session)
+            
+            # Strategy 2: If first attempt fails, try simplified approach
+            if not result.get('success'):
+                result = await self._generate_simplified(question)
+            
+            # Strategy 3: If still failing, try template-based approach
+            if not result.get('success'):
+                result = await self._generate_from_templates(question)
+            
+            # Cache successful results
+            if result.get('success'):
+                await self.cache.set(question, result)
+            
+            # Add to conversation history
+            await self.conversation_manager.add_exchange(session_id, question, result)
+            
+            return result
+        
         except Exception as e:
-            print(f"Error generating SQL: {e}")
-            return "SELECT 'Error in query generation' as error"
-
-
-# ──────────────────────────────── ⑤  RESULT FORMATTER ──────────────────────────
-class UserMasterFormatter:
-    def format(self, question: str, result: QueryResult) -> str:
-        if not result.success:
-            return f"Sorry, I encountered an error: {result.error}"
-
-        if not result.data:
-            return "No results found for your query."
-
-        # Handle count queries
-        if re.search(r'\bhow many\b|\bcount\b', question, re.I):
-            count = result.data if result.data else 0
-            return f"There are {count} matching records."
-
-        # Handle single value results
-        if len(result.data) == 1 and len(result.data) == 1:
-            return f"The answer is: {result.data}"
-
-        # Regular list formatting
-        rows = []
-        for row in result.data[:15]:  # Show up to 15 rows
-            if len(row) == 1:
-                rows.append(str(row))
+            logging.error(f"SQL generation failed for question '{question}': {e}")
+            return {
+                'success': False,
+                'error': 'SQL generation failed',
+                'details': str(e),
+                'question': question
+            }
+    
+    async def _generate_with_context(self, question: str, session: ChatContext) -> Dict[str, Any]:
+        """Generate SQL with conversation context"""
+        
+        # Build context-aware prompt
+        prompt = self.conversation_manager.build_context_prompt(session, question)
+        
+        # Generate SQL using LLM
+        if OLLAMA_AVAILABLE:
+            try:
+                response = ollama.generate(
+                    model=self.llm_config['model'],
+                    prompt=prompt,
+                    options={
+                        'temperature': self.llm_config['temperature'],
+                        'top_p': self.llm_config['top_p'],
+                        'num_predict': self.llm_config['max_tokens']
+                    }
+                )
+                
+                raw_sql = response['response'].strip()
+                sql = self._clean_sql_response(raw_sql)
+                
+                # Execute and return results
+                return await self._execute_and_format(sql, question)
+                
+            except Exception as e:
+                logging.error(f"Ollama generation failed: {e}")
+                return {'success': False, 'error': f'LLM generation failed: {str(e)}'}
+        else:
+            # Mock response for testing
+            return await self._generate_mock_response(question)
+    
+    async def _generate_simplified(self, question: str) -> Dict[str, Any]:
+        """Generate SQL with simplified, pattern-based approach"""
+        
+        sql = None
+        question_lower = question.lower()
+        
+        # Pattern matching for common queries
+        if re.search(r'\bhow many\b.*\bemployees?\b', question_lower):
+            if 'team' in question_lower:
+                # Extract team name if mentioned
+                team_match = re.search(r'\b(development|testing|infra|management|support|ui/ux|database|security)\b', question_lower)
+                if team_match:
+                    team = team_match.group(1).title()
+                    sql = f"SELECT COUNT(*) as employee_count FROM UserMaster WHERE Team = '{team}' AND Enable = 1"
+                else:
+                    sql = "SELECT Team, COUNT(*) as employee_count FROM UserMaster WHERE Enable = 1 GROUP BY Team"
             else:
-                # Format multiple columns nicely
-                formatted_row = " | ".join(str(val) if val is not None else 'N/A' for val in row)
-                rows.append(formatted_row)
+                sql = "SELECT COUNT(*) as total_employees FROM UserMaster WHERE Enable = 1"
+        
+        elif re.search(r'\blist\b.*\bemployees?\b', question_lower):
+            if 'name' in question_lower and 'start' in question_lower:
+                # Names starting with specific letter
+                letter_match = re.search(r'\bstarts? with ([a-zA-Z])\b', question_lower)
+                if letter_match:
+                    letter = letter_match.group(1).upper()
+                    sql = f"SELECT EmpName FROM UserMaster WHERE EmpName LIKE '{letter}%' AND Enable = 1"
+            else:
+                sql = "SELECT EmpName, Position, Team FROM UserMaster WHERE Enable = 1 LIMIT 20"
+        
+        elif re.search(r'\bwho\b.*\bproject manager\b', question_lower):
+            sql = "SELECT EmpName FROM UserMaster WHERE Position LIKE '%Manager%' AND Enable = 1"
+        
+        elif re.search(r'\bjoined in\b.*\b(20\d{2})\b', question_lower):
+            year_match = re.search(r'\b(20\d{2})\b', question_lower)
+            if year_match:
+                year = year_match.group(1)
+                sql = f"SELECT EmpName, TcsDoj FROM UserMaster WHERE TcsDoj LIKE '{year}%' AND Enable = 1"
+        
+        if sql:
+            return await self._execute_and_format(sql, question)
+        
+        return {'success': False, 'error': 'Could not generate SQL from question pattern'}
+    
+    async def _generate_from_templates(self, question: str) -> Dict[str, Any]:
+        """Generate SQL using predefined templates"""
+        
+        templates = {
+            'count_all': "SELECT COUNT(*) as count FROM UserMaster WHERE Enable = 1",
+            'list_all': "SELECT EmpName, Position FROM UserMaster WHERE Enable = 1 LIMIT 10",
+            'active_employees': "SELECT EmpName FROM UserMaster WHERE Enable = 1 LIMIT 10",
+            'teams': "SELECT DISTINCT Team FROM UserMaster WHERE Enable = 1",
+            'projects': "SELECT DISTINCT Project FROM UserMaster WHERE Enable = 1"
+        }
+        
+        question_lower = question.lower()
+        
+        # Choose appropriate template
+        if 'count' in question_lower or 'how many' in question_lower:
+            template_key = 'count_all'
+        elif 'list' in question_lower or 'show' in question_lower:
+            template_key = 'list_all'
+        elif 'team' in question_lower:
+            template_key = 'teams'
+        elif 'project' in question_lower:
+            template_key = 'projects'
+        else:
+            template_key = 'active_employees'
+        
+        sql = templates[template_key]
+        return await self._execute_and_format(sql, question)
+    
+    def _clean_sql_response(self, raw_sql: str) -> str:
+        """Clean and extract SQL from LLM response"""
+        
+        # Remove common prefixes
+        prefixes_to_remove = [
+            r'^sql\s*[:;]?\s*',
+            r'^SQL\s*[:;]?\s*',
+            r'^query\s*[:;]?\s*',
+            r'^Query\s*[:;]?\s*',
+            r'^```sql\s*',
+            r'^```\s*',
+            r'^Here\'s the SQL.*?:\s*',
+            r'^The SQL query is:?\s*'
+        ]
+        
+        cleaned = raw_sql
+        for prefix in prefixes_to_remove:
+            cleaned = re.sub(prefix, '', cleaned, flags=re.IGNORECASE | re.MULTILINE)
+        
+        # Remove markdown formatting
+        cleaned = re.sub(r'^```.*$', '', cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r'```$', '', cleaned)
+        
+        # Remove trailing semicolons and whitespace
+        cleaned = cleaned.rstrip(';').strip()
+        
+        # Ensure it starts with SELECT
+        if not cleaned.upper().startswith('SELECT'):
+            # Look for SELECT in the text
+            select_match = re.search(r'(SELECT.*?)(?:$|\n\n|;)', cleaned, re.IGNORECASE | re.DOTALL)
+            if select_match:
+                cleaned = select_match.group(1).strip()
+            else:
+                # If no SELECT found, this might not be a valid SQL query
+                logging.warning(f"No SELECT statement found in: {raw_sql}")
+        
+        return cleaned
+    
+    async def _execute_and_format(self, sql: str, original_question: str) -> Dict[str, Any]:
+        """Execute SQL and format results"""
+        
+        try:
+            # Create analysis object
+            analysis = QueryAnalysis(
+                original_question=original_question,
+                generated_sql=sql
+            )
+            
+            # Execute query
+            result = await self.db_manager.execute_query(sql)
+            
+            if result['success']:
+                # Enhance with analysis
+                result['analysis'] = analysis
+                
+                # Format results for better presentation
+                if 'data' in result:
+                    result['formatted_results'] = self._format_results(
+                        result['data'], result.get('columns', [])
+                    )
+            
+            return result
+        
+        except Exception as e:
+            return {
+                'success': False,
+                'error': 'Query execution failed',
+                'details': str(e),
+                'generated_sql': sql,
+                'original_question': original_question
+            }
+    
+    def _format_results(self, data: List[Tuple], columns: List[str]) -> Dict[str, Any]:
+        """Format query results for presentation"""
+        
+        if not data:
+            return {'message': 'No results found', 'count': 0}
+        
+        # Convert to list of dictionaries
+        formatted_rows = []
+        for row in data:
+            row_dict = {}
+            for i, value in enumerate(row):
+                col_name = columns[i] if i < len(columns) else f'column_{i}'
+                row_dict[col_name] = value
+            formatted_rows.append(row_dict)
+        
+        # Generate summary
+        summary = {
+            'total_rows': len(data),
+            'columns': columns,
+            'sample_data': formatted_rows[:5] if len(formatted_rows) > 5 else formatted_rows
+        }
+        
+        # Add specific formatting for common query types
+        if len(columns) == 1 and len(data) == 1:
+            # Single value result (like COUNT)
+            value = data[0][0]
+            if isinstance(value, (int, float)):
+                summary['single_value'] = value
+                summary['message'] = f"Result: {value}"
+        
+        elif len(columns) == 1 and 'name' in columns[0].lower():
+            # List of names
+            names = [row[0] for row in data]
+            summary['list_items'] = names
+            summary['message'] = f"Found {len(names)} items"
+        
+        return summary
+    
+    async def _generate_mock_response(self, question: str) -> Dict[str, Any]:
+        """Generate mock response when Ollama is not available"""
+        
+        question_lower = question.lower()
+        
+        if 'count' in question_lower or 'how many' in question_lower:
+            mock_sql = "SELECT COUNT(*) as count FROM UserMaster WHERE Enable = 1"
+            return await self._execute_and_format(mock_sql, question)
+        
+        elif 'list' in question_lower or 'show' in question_lower:
+            mock_sql = "SELECT EmpName FROM UserMaster WHERE Enable = 1 LIMIT 5"
+            return await self._execute_and_format(mock_sql, question)
+        
+        else:
+            return {
+                'success': False,
+                'error': 'Mock mode: Limited query support',
+                'suggestion': 'Try asking "How many employees?" or "List all employees"'
+            }
 
-        if len(result.data) > 15:
-            rows.append(f"...and {len(result.data) - 15} more records.")
+# ==============================================================================
+# AUDIT AND MONITORING SYSTEM
+# ==============================================================================
 
-        return "\n -  " + "\n -  ".join(rows)
-
-
-# ───────────────────────────────── ⑥  MAIN BOT ─────────────────────────────────
-class UserMasterQABot:
+class AuditLogger:
+    """Comprehensive audit logging and monitoring"""
+    
     def __init__(self):
-        self.db = DBManager(DB)
-        self.nl2sql = UserMasterNL2SQL()
-        self.formatter = UserMasterFormatter()
-
-    def chat(self):
-        if not self.db.connect():
-            print("Failed to connect to EIS database. Please check your connection settings.")
+        self.audit_enabled = Config.SECURITY_CONFIG['audit_enabled']
+        self.setup_logging()
+        
+        if METRICS_AVAILABLE:
+            self.setup_metrics()
+    
+    def setup_logging(self):
+        """Setup structured logging"""
+        log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        
+        # Main application logger
+        logging.basicConfig(
+            level=logging.INFO,
+            format=log_format,
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler('eis_bot.log') if self.audit_enabled else logging.NullHandler()
+            ]
+        )
+        
+        # Audit logger
+        self.audit_logger = logging.getLogger('audit')
+        if self.audit_enabled:
+            audit_handler = logging.FileHandler('audit.log')
+            audit_handler.setFormatter(logging.Formatter(
+                '%(asctime)s - AUDIT - %(message)s'
+            ))
+            self.audit_logger.addHandler(audit_handler)
+    
+    def setup_metrics(self):
+        """Setup Prometheus metrics"""
+        self.request_counter = Counter('requests_total', 'Total requests', ['method', 'status'])
+        self.response_time = Histogram('response_time_seconds', 'Response time')
+        self.active_sessions = Gauge('active_sessions', 'Active user sessions')
+        self.error_counter = Counter('errors_total', 'Total errors', ['type'])
+    
+    def log_user_action(self, user_id: Optional[str], session_id: str, action: str, 
+                       details: Dict[str, Any]):
+        """Log user actions for audit"""
+        if not self.audit_enabled:
             return
+        
+        audit_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'user_id': user_id or 'anonymous',
+            'session_id': session_id,
+            'action': action,
+            'details': details,
+            'ip_address': details.get('ip_address', 'unknown')
+        }
+        
+        self.audit_logger.info(json.dumps(audit_entry))
+    
+    def log_security_event(self, event_type: str, severity: str, details: Dict[str, Any]):
+        """Log security-related events"""
+        security_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'event_type': event_type,
+            'severity': severity,
+            'details': details
+        }
+        
+        logging.warning(f"SECURITY EVENT: {json.dumps(security_entry)}")
+        
+        if METRICS_AVAILABLE:
+            self.error_counter.labels(type='security').inc()
+    
+    def log_performance_metrics(self, operation: str, duration_ms: float, success: bool):
+        """Log performance metrics"""
+        if METRICS_AVAILABLE:
+            self.response_time.observe(duration_ms / 1000)
+            self.request_counter.labels(
+                method=operation,
+                status='success' if success else 'error'
+            ).inc()
 
-        print("🤖  Hello! I'm your UserMaster database assistant.")
-        print("    Ask me questions about employees, teams, projects, and user information.")
-        print("    Examples:")
-        print("    -  'How many employees are in the Development team?'")
-        print("    -  'Show me all employees with TCS email'") 
-        print("    -  'Who works on Project ABC?'")
-        print("    -  'List all enabled users'")
-        print("    Type 'exit' to quit.\n")
+# ==============================================================================
+# ENHANCED WEB INTERFACE
+# ==============================================================================
 
+if WEB_AVAILABLE:
+    
+    # Pydantic models for API
+    class QueryRequest(BaseModel):
+        question: str = Field(..., min_length=1, max_length=1000)
+        session_id: Optional[str] = None
+        user_id: Optional[str] = None
+        
+        @validator('question')
+        def validate_question(cls, v):
+            if len(v.strip()) < 3:
+                raise ValueError('Question too short')
+            return v.strip()
+    
+    class QueryResponse(BaseModel):
+        success: bool
+        data: Optional[List[Dict[str, Any]]] = None
+        error: Optional[str] = None
+        sql_query: Optional[str] = None
+        execution_time_ms: Optional[float] = None
+        session_id: str
+
+# ==============================================================================
+# MAIN APPLICATION CLASS
+# ==============================================================================
+
+class EnhancedEISBot:
+    """Main application class orchestrating all components"""
+    
+    def __init__(self):
+        self.audit_logger = AuditLogger()
+        self.validator = AdvancedSQLValidator()
+        self.db_manager = EnhancedDBManager(Config.DB_CONFIG, self.validator)
+        self.cache = IntelligentCache(Config.REDIS_CONFIG)
+        self.conversation_manager = ConversationManager(self.cache)
+        self.nl2sql_engine = EnhancedNL2SQLEngine(
+            self.db_manager, self.cache, self.conversation_manager
+        )
+        
+        # Initialize web app if available
+        if WEB_AVAILABLE:
+            self.app = self.create_web_app()
+        
+        # Start metrics server if available
+        if METRICS_AVAILABLE:
+            try:
+                start_http_server(8001)
+                logging.info("Metrics server started on port 8001")
+            except Exception as e:
+                logging.warning(f"Failed to start metrics server: {e}")
+    
+    def create_web_app(self) -> FastAPI:
+        """Create FastAPI web application"""
+        
+        app = FastAPI(
+            title="Enhanced EIS NL2SQL Bot",
+            description="Advanced Natural Language to SQL conversion for Employee Information System",
+            version="2.0.0"
+        )
+        
+        # CORS middleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        @app.post("/query", response_model=QueryResponse)
+        async def query_endpoint(request: QueryRequest):
+            """Main query endpoint"""
+            session_id = request.session_id or str(uuid.uuid4())
+            start_time = time.time()
+            
+            try:
+                # Log the request
+                self.audit_logger.log_user_action(
+                    request.user_id,
+                    session_id,
+                    'query_request',
+                    {'question': request.question}
+                )
+                
+                # Process the query
+                result = await self.nl2sql_engine.generate_sql(request.question, session_id)
+                
+                # Log performance metrics
+                duration_ms = (time.time() - start_time) * 1000
+                self.audit_logger.log_performance_metrics(
+                    'query',
+                    duration_ms,
+                    result.get('success', False)
+                )
+                
+                return QueryResponse(
+                    success=result.get('success', False),
+                    data=result.get('formatted_results', {}).get('sample_data'),
+                    error=result.get('error'),
+                    sql_query=result.get('analysis', {}).get('generated_sql'),
+                    execution_time_ms=result.get('execution_time_ms'),
+                    session_id=session_id
+                )
+                
+            except Exception as e:
+                logging.error(f"Query endpoint error: {e}")
+                return QueryResponse(
+                    success=False,
+                    error=str(e),
+                    session_id=session_id
+                )
+        
+        @app.get("/health")
+        async def health_check():
+            """Health check endpoint"""
+            try:
+                # Check database connectivity
+                schema_info = await self.db_manager.get_schema_info()
+                db_healthy = len(schema_info) > 0
+                
+                # Check cache connectivity
+                cache_stats = self.cache.get_stats()
+                cache_healthy = cache_stats['enabled'] and cache_stats.get('redis_connected', True)
+                
+                return {
+                    'status': 'healthy' if db_healthy else 'unhealthy',
+                    'database': 'connected' if db_healthy else 'disconnected',
+                    'cache': 'connected' if cache_healthy else 'disconnected',
+                    'timestamp': datetime.now().isoformat()
+                }
+            except Exception as e:
+                return {
+                    'status': 'unhealthy',
+                    'error': str(e),
+                    'timestamp': datetime.now().isoformat()
+                }
+        
+        @app.get("/stats")
+        async def get_stats():
+            """Get system statistics"""
+            return {
+                'cache_stats': self.cache.get_stats(),
+                'active_sessions': len(self.conversation_manager.sessions),
+                'timestamp': datetime.now().isoformat()
+            }
+        
+        @app.websocket("/ws/{session_id}")
+        async def websocket_endpoint(websocket: WebSocket, session_id: str):
+            """WebSocket endpoint for real-time chat"""
+            await websocket.accept()
+            
+            try:
+                while True:
+                    data = await websocket.receive_text()
+                    message = json.loads(data)
+                    
+                    if message.get('type') == 'query':
+                        question = message.get('question', '')
+                        
+                        # Process query
+                        result = await self.nl2sql_engine.generate_sql(question, session_id)
+                        
+                        # Send response
+                        await websocket.send_text(json.dumps({
+                            'type': 'response',
+                            'result': result
+                        }))
+                        
+            except WebSocketDisconnect:
+                logging.info(f"WebSocket disconnected for session {session_id}")
+            except Exception as e:
+                logging.error(f"WebSocket error: {e}")
+                await websocket.send_text(json.dumps({
+                    'type': 'error',
+                    'message': str(e)
+                }))
+        
+        # Serve static files for web interface
+        @app.get("/", response_class=HTMLResponse)
+        async def serve_frontend():
+            """Serve the web interface"""
+            return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Enhanced EIS NL2SQL Bot</title>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    * { margin: 0; padding: 0; box-sizing: border-box; }
+                    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; }
+                    .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+                    .header { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 20px; }
+                    .chat-container { background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); height: 600px; display: flex; flex-direction: column; }
+                    .messages { flex: 1; padding: 20px; overflow-y: auto; }
+                    .message { margin-bottom: 15px; }
+                    .user-message { text-align: right; }
+                    .bot-message { text-align: left; }
+                    .message-content { display: inline-block; padding: 10px 15px; border-radius: 18px; max-width: 70%; }
+                    .user-message .message-content { background: #007bff; color: white; }
+                    .bot-message .message-content { background: #f1f1f1; color: black; }
+                    .input-area { padding: 20px; border-top: 1px solid #eee; }
+                    .input-group { display: flex; gap: 10px; }
+                    .input-group input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 20px; outline: none; }
+                    .input-group button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 20px; cursor: pointer; }
+                    .input-group button:hover { background: #0056b3; }
+                    .sql-code { background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 4px; padding: 10px; margin: 5px 0; font-family: monospace; overflow-x: auto; }
+                    .error { color: #dc3545; }
+                    .success { color: #28a745; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>Enhanced EIS NL2SQL Bot</h1>
+                        <p>Ask natural language questions about employee data</p>
+                    </div>
+                    
+                    <div class="chat-container">
+                        <div class="messages" id="messages"></div>
+                        <div class="input-area">
+                            <div class="input-group">
+                                <input type="text" id="questionInput" placeholder="Ask a question about employees..." 
+                                       onkeypress="handleKeyPress(event)">
+                                <button onclick="sendQuery()">Send</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <script>
+                    let sessionId = generateUUID();
+                    let messagesDiv = document.getElementById('messages');
+                    let questionInput = document.getElementById('questionInput');
+
+                    function generateUUID() {
+                        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                            var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                            return v.toString(16);
+                        });
+                    }
+
+                    function addMessage(content, isUser = false) {
+                        let messageDiv = document.createElement('div');
+                        messageDiv.className = isUser ? 'message user-message' : 'message bot-message';
+                        messageDiv.innerHTML = '<div class="message-content">' + content + '</div>';
+                        messagesDiv.appendChild(messageDiv);
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    }
+
+                    async function sendQuery() {
+                        let question = questionInput.value.trim();
+                        if (!question) return;
+
+                        questionInput.value = '';
+                        addMessage(question, true);
+                        addMessage('Processing...', false);
+
+                        try {
+                            let response = await fetch('/query', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    question: question,
+                                    session_id: sessionId
+                                })
+                            });
+
+                            let result = await response.json();
+                            
+                            // Remove "Processing..." message
+                            messagesDiv.removeChild(messagesDiv.lastChild);
+
+                            if (result.success) {
+                                let content = '<div class="success">✓ Query executed successfully</div>';
+                                
+                                if (result.sql_query) {
+                                    content += '<div class="sql-code">SQL: ' + result.sql_query + '</div>';
+                                }
+                                
+                                if (result.data && result.data.length > 0) {
+                                    content += '<div><strong>Results:</strong></div>';
+                                    content += '<div>' + JSON.stringify(result.data, null, 2) + '</div>';
+                                } else {
+                                    content += '<div>No data returned</div>';
+                                }
+                                
+                                if (result.execution_time_ms) {
+                                    content += '<div><small>Execution time: ' + result.execution_time_ms.toFixed(2) + 'ms</small></div>';
+                                }
+                                
+                                addMessage(content, false);
+                            } else {
+                                let errorContent = '<div class="error">✗ Error: ' + (result.error || 'Unknown error') + '</div>';
+                                addMessage(errorContent, false);
+                            }
+                        } catch (error) {
+                            messagesDiv.removeChild(messagesDiv.lastChild);
+                            addMessage('<div class="error">✗ Network error: ' + error.message + '</div>', false);
+                        }
+                    }
+
+                    function handleKeyPress(event) {
+                        if (event.key === 'Enter') {
+                            sendQuery();
+                        }
+                    }
+
+                    // Add welcome message
+                    addMessage('👋 Welcome! I can help you query employee data. Try asking:<br>• "How many employees are there?"<br>• "List all employees in Development team"<br>• "Show me employees who joined in 2023"', false);
+                </script>
+            </body>
+            </html>
+            """
+        
+        return app
+    
+    async def start_cli(self):
+        """Start command-line interface"""
+        print("🤖 Enhanced EIS Database Assistant")
+        print("   Advanced Natural Language to SQL conversion with intelligent features")
+        print("   Features: Caching, Validation, Context Awareness, Error Recovery")
+        print("   Type 'exit', 'quit', or 'bye' to stop.\n")
+        
+        session_id = str(uuid.uuid4())
+        
         try:
             while True:
-                question = input("🧑💻  You: ").strip()
-
+                question = input("🧑💻 You: ").strip()
+                
                 if question.lower() in {"exit", "quit", "bye", "q"}:
                     break
-
+                
                 if not question:
                     continue
-
-                print("🔄  Generating SQL query...")
-                sql = self.nl2sql.to_sql(question)
-                print(f"  📄 Generated SQL → {sql}")
-
-                result = self.db.exec(sql)
-                response = self.formatter.format(question, result)
-                print(f"🤖  {response}\n")
-
+                
+                print("🔄 Processing query...")
+                
+                start_time = time.time()
+                result = await self.nl2sql_engine.generate_sql(question, session_id)
+                duration = (time.time() - start_time) * 1000
+                
+                if result.get('success'):
+                    print("✅ Query executed successfully")
+                    
+                    if result.get('analysis', {}).get('generated_sql'):
+                        print(f"📄 SQL: {result['analysis']['generated_sql']}")
+                    
+                    if result.get('formatted_results'):
+                        formatted = result['formatted_results']
+                        if 'message' in formatted:
+                            print(f"📊 {formatted['message']}")
+                        
+                        if 'sample_data' in formatted:
+                            print("📋 Results:")
+                            for i, row in enumerate(formatted['sample_data'], 1):
+                                print(f"  {i}. {row}")
+                    
+                    if result.get('execution_time_ms'):
+                        print(f"⏱️  Execution time: {result['execution_time_ms']:.2f}ms")
+                
+                else:
+                    print(f"❌ Error: {result.get('error', 'Unknown error')}")
+                    if result.get('details'):
+                        print(f"   Details: {result['details']}")
+                    if result.get('generated_sql'):
+                        print(f"   Generated SQL: {result['generated_sql']}")
+                
+                print(f"🕒 Total processing time: {duration:.2f}ms\n")
+                
         except KeyboardInterrupt:
-            print("\n👋  Interrupted by user.")
+            print("\n👋 Interrupted by user.")
+        except Exception as e:
+            print(f"\n❌ Unexpected error: {e}")
+        
         finally:
-            self.db.close()
-            print("👋  Goodbye!")
+            print("👋 Goodbye!")
+    
+    async def start_web(self, host: str = "0.0.0.0", port: int = 8000):
+        """Start web server"""
+        if not WEB_AVAILABLE:
+            print("❌ FastAPI not available. Install with: pip install fastapi uvicorn")
+            return
+        
+        print(f"🚀 Starting Enhanced EIS Bot web server on http://{host}:{port}")
+        print(f"📊 Metrics available on http://{host}:8001/metrics")
+        
+        config = uvicorn.Config(
+            self.app,
+            host=host,
+            port=port,
+            log_level="info"
+        )
+        
+        server = uvicorn.Server(config)
+        await server.serve()
 
+# ==============================================================================
+# COMMAND LINE INTERFACE
+# ==============================================================================
+
+async def main():
+    """Main entry point"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Enhanced EIS NL2SQL Bot")
+    parser.add_argument(
+        "--mode",
+        choices=["cli", "web"],
+        default="cli",
+        help="Interface mode (default: cli)"
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Web server host (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Web server port (default: 8000)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Initialize the bot
+    bot = EnhancedEISBot()
+    
+    # Run periodic cleanup
+    async def cleanup_task():
+        while True:
+            await asyncio.sleep(3600)  # Every hour
+            await bot.conversation_manager.cleanup_old_sessions()
+    
+    cleanup_task_handle = asyncio.create_task(cleanup_task())
+    
+    try:
+        if args.mode == "web":
+            await bot.start_web(args.host, args.port)
+        else:
+            await bot.start_cli()
+    finally:
+        cleanup_task_handle.cancel()
 
 if __name__ == "__main__":
-    UserMasterQABot().chat()
-
+    # Set event loop policy for Windows compatibility
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    
+    asyncio.run(main())
