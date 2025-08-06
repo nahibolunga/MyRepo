@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+Database Question-Answering Bot for EIS Database (UserMaster)
+------------------------------------------------------------
+Ask natural-language questions about team members and get answers from MySQL.
+Type exit / quit / bye to leave.
+"""
+
+import re
+import ollama                   # local LLM
+import pymysql                  # MySQL driver
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
+# ─────────────────────────────────── ①  CONFIG ──────────────────────────────────
+DB = dict(
+    host="localhost",
+    user="root",
+    password="Root@123",
+    database="EIS",
+    charset="utf8mb4",
+)
+
+MISTRAL_MODEL = "mistral:7b-instruct-q4_K_M"
+
+# Database schema for UserMaster table
+DETAILED_SCHEMA = """
+Database: EIS
+
+Table: UserMaster
+Columns: 
+- Uid (int unsigned PK) - User ID
+- EmpName (varchar(80)) - Employee Name  
+- Pwd (varchar(45)) - Password
+- SecQ (varchar(45)) - Security Question
+- SecA (varchar(45)) - Security Answer
+- Project (varchar(45)) - Project Name
+- Team (varchar(45)) - Team Name
+- Rid (int unsigned FK) - Role ID
+- Level (varchar(10)) - Employee Level
+- Contact (varchar(11)) - Contact Number
+- Mandatory (varchar(10)) - Mandatory field
+- SuperLevel (varchar(10)) - Super Level
+- Tid (int) - Team ID
+- Enable (int) - Enable status (1=enabled, 0=disabled)
+- TcsDoj (varchar(20)) - TCS Date of Joining
+- SbiDoj (varchar(20)) - SBI Date of Joining  
+- TcsEmail (varchar(80) UNIQUE) - TCS Email
+- SbiEmail (varchar(80)) - SBI Email
+- AdId (varchar(30) UNIQUE) - AD ID
+- IdCard (varchar(30) UNIQUE) - ID Card Number
+- AccessCard (varchar(30) UNIQUE) - Access Card Number
+- Onboarding (varchar(20)) - Onboarding Status
+- OnboardedOn (date) - Onboarding Date
+- PvcAppId (varchar(30) UNIQUE) - PVC Application ID
+- PvcStatus (varchar(30)) - PVC Status
+- PvcActionDate (varchar(30)) - PVC Action Date
+- BACompany (varchar(80)) - BA Company
+- Phone (varchar(4)) - Phone Extension
+- Position (varchar(20)) - Position/Role
+
+IMPORTANT NOTES:
+- Enable field: 1 = enabled/active, 0 = disabled/inactive
+- Uid is the primary key
+- TcsEmail, AdId, IdCard, AccessCard, PvcAppId are UNIQUE fields
+- Use LIKE operator for partial name/email searches
+- Date fields may contain string dates, handle accordingly
+"""
+
+
+# ──────────────────────────────── ②  DATA CLASSES ───────────────────────────────
+@dataclass
+class QueryResult:
+    success: bool
+    data: Optional[List[Tuple]] = None
+    error: Optional[str] = None
+    sql: Optional[str] = None
+
+
+# ──────────────────────────────── ③  DB MANAGER ────────────────────────────────
+class DBManager:
+    def __init__(self, cfg: Dict):
+        self.cfg, self.conn = cfg, None
+
+    def connect(self) -> bool:
+        try:
+            self.conn = pymysql.connect(**self.cfg)
+            return True
+        except Exception as e:
+            print(f"❌  DB connection error: {e}")
+            return False
+
+    def exec(self, sql: str) -> QueryResult:
+        if not self.conn and not self.connect():
+            return QueryResult(False, error="DB connection failed", sql=sql)
+
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                return QueryResult(True, rows, sql=sql)
+        except Exception as e:
+            return QueryResult(False, error=str(e), sql=sql)
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+
+# ───────────────────────────── ④  NL ➜ SQL CONVERTER ────────────────────────────
+class UserMasterNL2SQL:
+    @staticmethod
+    def create_prompt(question: str) -> str:
+        return f"""You are an expert MySQL query generator for employee/user data. Generate ONLY a valid MySQL SELECT statement.
+
+{DETAILED_SCHEMA}
+
+CRITICAL RULES:
+1. Use EXACT column names from the schema above
+2. Table name is "UserMaster" (case-sensitive)
+3. For name searches, use LIKE with % wildcards (e.g., EmpName LIKE '%john%')
+4. For email searches, use LIKE with % wildcards  
+5. Use Enable=1 for active/enabled users, Enable=0 for inactive/disabled
+6. Return ONLY the SQL query, no explanations or formatting
+7. For counting queries, use COUNT(*)
+8. For "who" questions, include EmpName in SELECT
+9. Use proper MySQL syntax and functions
+
+Question: {question}
+
+SQL:"""
+
+    def to_sql(self, question: str) -> str:
+        try:
+            response = ollama.generate(
+                model=MISTRAL_MODEL,
+                prompt=self.create_prompt(question),
+                options=dict(temperature=0.1, top_p=0.8, num_predict=300),
+            )["response"]
+
+            # Clean the response
+            sql = response.strip()
+
+            # Remove common prefixes and markdown
+            prefixes_to_remove = [
+                r'^sql\s*[:;]?\s*',
+                r'^SQL\s*[:;]?\s*', 
+                r'^query\s*[:;]?\s*',
+                r'^SELECT\s*:\s*',
+                r'^```',
+                r'^```\s*',
+                r'```'
+            ]
+
+            for prefix in prefixes_to_remove:
+                sql = re.sub(prefix, '', sql, flags=re.IGNORECASE | re.MULTILINE)
+
+            # Remove trailing semicolons and whitespace
+            sql = sql.rstrip(';').strip()
+
+            # Ensure it starts with SELECT
+            if not sql.upper().startswith('SELECT'):
+                select_match = re.search(r'(SELECT.*?)(?:|$)', sql, re.IGNORECASE | re.DOTALL)
+                if select_match:
+                    sql = select_match.group(1).strip()
+                else:
+                    return "SELECT 'Invalid query generated' as error"
+
+            return sql
+
+        except Exception as e:
+            print(f"Error generating SQL: {e}")
+            return "SELECT 'Error in query generation' as error"
+
+
+# ──────────────────────────────── ⑤  RESULT FORMATTER ──────────────────────────
+class UserMasterFormatter:
+    def format(self, question: str, result: QueryResult) -> str:
+        if not result.success:
+            return f"Sorry, I encountered an error: {result.error}"
+
+        if not result.data:
+            return "No results found for your query."
+
+        # Handle count queries
+        if re.search(r'\bhow many\b|\bcount\b', question, re.I):
+            count = result.data if result.data else 0
+            return f"There are {count} matching records."
+
+        # Handle single value results
+        if len(result.data) == 1 and len(result.data) == 1:
+            return f"The answer is: {result.data}"
+
+        # Regular list formatting
+        rows = []
+        for row in result.data[:15]:  # Show up to 15 rows
+            if len(row) == 1:
+                rows.append(str(row))
+            else:
+                # Format multiple columns nicely
+                formatted_row = " | ".join(str(val) if val is not None else 'N/A' for val in row)
+                rows.append(formatted_row)
+
+        if len(result.data) > 15:
+            rows.append(f"...and {len(result.data) - 15} more records.")
+
+        return "\n -  " + "\n -  ".join(rows)
+
+
+# ───────────────────────────────── ⑥  MAIN BOT ─────────────────────────────────
+class UserMasterQABot:
+    def __init__(self):
+        self.db = DBManager(DB)
+        self.nl2sql = UserMasterNL2SQL()
+        self.formatter = UserMasterFormatter()
+
+    def chat(self):
+        if not self.db.connect():
+            print("Failed to connect to EIS database. Please check your connection settings.")
+            return
+
+        print("🤖  Hello! I'm your UserMaster database assistant.")
+        print("    Ask me questions about employees, teams, projects, and user information.")
+        print("    Examples:")
+        print("    -  'How many employees are in the Development team?'")
+        print("    -  'Show me all employees with TCS email'") 
+        print("    -  'Who works on Project ABC?'")
+        print("    -  'List all enabled users'")
+        print("    Type 'exit' to quit.\n")
+
+        try:
+            while True:
+                question = input("🧑💻  You: ").strip()
+
+                if question.lower() in {"exit", "quit", "bye", "q"}:
+                    break
+
+                if not question:
+                    continue
+
+                print("🔄  Generating SQL query...")
+                sql = self.nl2sql.to_sql(question)
+                print(f"  📄 Generated SQL → {sql}")
+
+                result = self.db.exec(sql)
+                response = self.formatter.format(question, result)
+                print(f"🤖  {response}\n")
+
+        except KeyboardInterrupt:
+            print("\n👋  Interrupted by user.")
+        finally:
+            self.db.close()
+            print("👋  Goodbye!")
+
+
+if __name__ == "__main__":
+    UserMasterQABot().chat()
+
